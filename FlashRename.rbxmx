@@ -1,0 +1,323 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">FlashRename</string>
+      <ProtectedString name="Source">if not plugin then return end
+
+local Selection = game:GetService("Selection")
+local RunService = game:GetService("RunService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local Ui = require(script.Ui)
+local Adapter = require(script.Adapter)
+local Transaction = require(script.Transaction)
+local panel = Ui.new(plugin, "FlashRename", "Flash Rename", "Rename")
+local plan = nil
+local status
+local preview
+local function invalidate()
+    plan = nil
+    if status then status.Text = "Selection or options changed. Preview again before applying." end
+    if preview then preview.Text = "" end
+end
+local options = Adapter.controls(panel, invalidate)
+status = panel.label("Select objects in Explorer, then preview the changes.")
+panel.button("Preview selection", function()
+    plan = nil
+    preview.Text = ""
+    if RunService:IsRunning() then status.Text = "Stop the play test first." return end
+    local ok, result = pcall(Adapter.plan, Selection:Get(), options())
+    if not ok then status.Text = tostring(result) return end
+    plan = result
+    status.Text = string.format("%d changes. Preview shows up to 100 rows. No objects have been edited.", #plan)
+    local lines = {}
+    for index, entry in ipairs(plan) do
+        if index &gt; 100 then break end
+        table.insert(lines, entry.label)
+    end
+    preview.Text = table.concat(lines, "\n\n")
+end)
+panel.button("Apply preview", function()
+    if RunService:IsRunning() then status.Text = "Stop the play test first." invalidate() return end
+    if not plan then status.Text = "Preview the selection first." return end
+    local _, message = Transaction.apply(plan, Adapter, {
+        begin = function() return ChangeHistoryService:TryBeginRecording("FlashRename.Apply", "Flash Rename") end,
+        finish = function(recording, commit)
+            ChangeHistoryService:FinishRecording(recording, if commit then Enum.FinishRecordingOperation.Commit else Enum.FinishRecordingOperation.Cancel)
+        end,
+    })
+    plan = nil
+    status.Text = message
+    preview.Text = ""
+end)
+preview = panel.label("")
+preview.TextSize = 14
+local selectionConnection = Selection.SelectionChanged:Connect(invalidate)
+plugin.Unloading:Connect(function()
+    selectionConnection:Disconnect()
+    panel.destroy()
+end)
+</ProtectedString>
+    </Properties>
+    <Item class="ModuleScript" referent="RBX1">
+      <Properties>
+        <string name="Name">Adapter</string>
+        <ProtectedString name="Source">local Rules = require(script.Parent.Rules)
+local Adapter = {}
+
+function Adapter.controls(panel, changed)
+    panel.label("Use {name} for the old name and {n} for a number. Objects are sorted by full path; exact ties keep selection order. Duplicate sibling names are refused.")
+    local template = panel.field("Name template", "Part_{n}")
+    local start = panel.field("First number", "1")
+    local padding = panel.field("Minimum number digits", "3")
+    for _, field in ipairs({ template, start, padding }) do field:GetPropertyChangedSignal("Text"):Connect(changed) end
+    return function() return { template = template.Text, start = tonumber(start.Text), padding = tonumber(padding.Text) } end
+end
+
+function Adapter.plan(selection, options)
+    local rows, siblings, parents, seen = {}, {}, {}, {}
+    assert(#selection &lt;= 500, "Select no more than 500 objects.")
+    for index, object in ipairs(selection) do
+        assert(object.Parent and object:IsDescendantOf(game) and object.Parent ~= game, "Select objects inside a service, not the service itself.")
+        if not seen[object] then
+            seen[object] = true
+            table.insert(rows, { target = object, parent = object.Parent, name = object.Name, path = object:GetFullName(), index = index })
+            parents[object.Parent] = true
+        end
+    end
+    local count = 0
+    for parent in pairs(parents) do
+        for _, sibling in ipairs(parent:GetChildren()) do
+            count = count + 1
+            assert(count &lt;= 10000, "Selected parents contain more than 10000 children. Use a smaller scope.")
+            table.insert(siblings, { target = sibling, parent = parent, name = sibling.Name })
+        end
+    end
+    local plan = Rules.plan(rows, siblings, options)
+    for _, entry in ipairs(plan) do entry.label = entry.before.path .. "\n" .. entry.before.name .. " -&gt; " .. entry.after end
+    return plan
+end
+
+function Adapter.validate(plan)
+    local proposed = {}
+    for _, entry in ipairs(plan) do
+        local before = entry.before
+        if not before.target:IsDescendantOf(game) or before.target.Parent ~= before.parent or before.target.Name ~= before.name then
+            return false, "An object was renamed, removed or reparented. Preview again."
+        end
+        proposed[before.target] = entry.after
+    end
+    local children, count = {}, 0
+    for _, entry in ipairs(plan) do
+        local parent = entry.before.parent
+        if not children[parent] then
+            children[parent] = parent:GetChildren()
+            count = count + #children[parent]
+            if count &gt; 10000 then return false, "The sibling scope grew too large. Preview again." end
+        end
+        for _, sibling in ipairs(children[parent]) do
+            if sibling ~= entry.before.target and (proposed[sibling] or sibling.Name) == entry.after then
+                return false, "A sibling now uses a proposed name. Preview again."
+            end
+        end
+    end
+    return true
+end
+
+function Adapter.write(entry)
+    entry.before.target.Name = entry.after
+end
+
+return Adapter
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX2">
+      <Properties>
+        <string name="Name">Rules</string>
+        <ProtectedString name="Source">local Rules = {}
+
+function Rules.plan(rows, siblings, options)
+    assert(#rows &gt; 0 and #rows &lt;= 500, "Select between 1 and 500 objects.")
+    assert(type(options.template) == "string" and #options.template &lt;= 100, "Template must be at most 100 bytes.")
+    local literal = options.template:gsub("{name}", ""):gsub("{n}", "")
+    assert(not literal:find("[{}]"), "Only {name} and {n} are supported. Literal braces are not supported.")
+    assert(type(options.start) == "number" and options.start % 1 == 0 and options.start &gt;= 0 and options.start + #rows &lt;= 1000001, "Start must be a whole number; the last number cannot exceed 1000000.")
+    assert(type(options.padding) == "number" and options.padding % 1 == 0 and options.padding &gt;= 1 and options.padding &lt;= 6, "Number padding must be from 1 to 6.")
+    local ordered = table.clone(rows)
+    table.sort(ordered, function(a, b)
+        if a.path == b.path then return a.index &lt; b.index end
+        return a.path &lt; b.path
+    end)
+    local proposed, selected, plan = {}, {}, {}
+    for index, row in ipairs(ordered) do
+        local number = string.format("%0" .. tostring(options.padding) .. "d", options.start + index - 1)
+        local name = options.template:gsub("{([a-z]+)}", function(token)
+            return if token == "name" then row.name else number
+        end)
+        assert(#name &gt; 0 and #name &lt;= 100 and name:match("%S") and not name:find("[%c]") and utf8.len(name), "A resulting name is blank, invalid UTF-8, contains control characters or exceeds 100 bytes.")
+        proposed[row.target] = name
+        selected[row.target] = true
+        if name ~= row.name then table.insert(plan, { before = row, after = name }) end
+    end
+    for _, row in ipairs(ordered) do
+        for _, sibling in ipairs(siblings) do
+            if sibling.parent == row.parent and sibling.target ~= row.target then
+                local other = if selected[sibling.target] then proposed[sibling.target] else sibling.name
+                assert(proposed[row.target] ~= other, "A resulting name conflicts with a sibling: " .. proposed[row.target])
+            end
+        end
+    end
+    return plan
+end
+
+return Rules
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX3">
+      <Properties>
+        <string name="Name">Transaction</string>
+        <ProtectedString name="Source">local Transaction = {}
+
+function Transaction.apply(plan, adapter, history)
+    if #plan == 0 then return false, "Nothing to change." end
+    local checked, valid, reason = pcall(adapter.validate, plan)
+    if not checked then return false, "The preview could not be checked. Preview again: " .. tostring(valid) end
+    if not valid then return false, reason end
+    local started, recording = pcall(history.begin)
+    if not started or not recording then
+        return false, "Studio could not start an undo recording. Try again in edit mode."
+    end
+    local ok, err = pcall(function()
+        for _, entry in ipairs(plan) do adapter.write(entry) end
+    end)
+    if ok then
+        ok, err = pcall(history.finish, recording, true)
+    end
+    if not ok then
+        local cancelled = pcall(history.finish, recording, false)
+        if not cancelled then
+            return false, "The edit failed and Studio could not cancel its recording. Check the place and undo history: " .. tostring(err)
+        end
+        return false, "The batch was cancelled: " .. tostring(err)
+    end
+    return true, string.format("Applied %d changes. Use Studio Undo to revert the batch.", #plan)
+end
+
+return Transaction
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX4">
+      <Properties>
+        <string name="Name">Ui</string>
+        <ProtectedString name="Source">local Ui = {}
+
+function Ui.new(plugin, id, title, action)
+    local studio = settings().Studio
+    local colors = {}
+    local connections = {}
+    local toolbar = plugin:CreateToolbar(title)
+    local toggle = toolbar:CreateButton(id, title, "", action)
+    local widget = plugin:CreateDockWidgetPluginGuiAsync(id .. "_v1", DockWidgetPluginGuiInfo.new(
+        Enum.InitialDockState.Right, false, false, 380, 600, 280, 260
+    ))
+    widget.Title = title
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.fromScale(1, 1)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 6
+    scroll.CanvasSize = UDim2.new()
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.Parent = widget
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 14)
+    padding.PaddingBottom = UDim.new(0, 14)
+    padding.PaddingLeft = UDim.new(0, 14)
+    padding.PaddingRight = UDim.new(0, 20)
+    padding.Parent = scroll
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 9)
+    layout.Parent = scroll
+    local order = 0
+    local function theme(object, property, color)
+        table.insert(colors, { object, property, color })
+        object[property] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[color])
+    end
+    theme(scroll, "BackgroundColor3", "MainBackground")
+    theme(scroll, "ScrollBarImageColor3", "MainText")
+    local function add(class, text)
+        order = order + 1
+        local object = Instance.new(class)
+        object.LayoutOrder = order
+        object.Size = UDim2.new(1, 0, 0, 32)
+        object.BorderSizePixel = 0
+        object.Font = Enum.Font.SourceSans
+        object.TextSize = 16
+        object.Text = text
+        object.TextWrapped = true
+        object.Parent = scroll
+        theme(object, "TextColor3", "MainText")
+        return object
+    end
+    local panel = { widget = widget }
+    function panel.label(text)
+        local object = add("TextLabel", text)
+        object.Size = UDim2.new(1, 0, 0, 0)
+        object.AutomaticSize = Enum.AutomaticSize.Y
+        object.BackgroundTransparency = 1
+        object.TextXAlignment = Enum.TextXAlignment.Left
+        return object
+    end
+    function panel.field(caption, initial)
+        panel.label(caption)
+        local object = add("TextBox", initial)
+        object.ClearTextOnFocus = false
+        object.TextWrapped = false
+        theme(object, "BackgroundColor3", "InputFieldBackground")
+        return object
+    end
+    function panel.button(text, callback)
+        local object = add("TextButton", text)
+        theme(object, "BackgroundColor3", "Button")
+        table.insert(connections, object.Activated:Connect(callback))
+        return object
+    end
+    function panel.cycle(caption, choices, changed)
+        local index = 1
+        local button
+        button = panel.button(caption .. ": " .. choices[index], function()
+            index = index % #choices + 1
+            button.Text = caption .. ": " .. choices[index]
+            changed()
+        end)
+        return function() return choices[index] end
+    end
+    panel.label(title)
+    table.insert(connections, toggle.Click:Connect(function() widget.Enabled = not widget.Enabled end))
+    table.insert(connections, widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+        toggle:SetActive(widget.Enabled)
+    end))
+    table.insert(connections, studio.ThemeChanged:Connect(function()
+        for _, item in ipairs(colors) do
+            item[1][item[2]] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[item[3]])
+        end
+    end))
+    toggle:SetActive(widget.Enabled)
+    function panel.destroy()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        widget:Destroy()
+        toolbar:Destroy()
+    end
+    return panel
+end
+
+return Ui
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
